@@ -23,7 +23,7 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   late TextEditingController _addrController;
   late TextEditingController _userController;
   late TextEditingController _pwdController;
@@ -47,6 +47,8 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
     _addrController =
         TextEditingController(text: widget.configRepository.consoleAddress);
     _userController =
@@ -79,6 +81,8 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+
     _addrController.dispose();
     _userController.dispose();
     _pwdController.dispose();
@@ -88,6 +92,18 @@ class _HomePageState extends State<HomePage> {
     // 如果你希望退出页面就把通知关掉，可以打开这一行：
     // NotificationService.instance.cancelStatusNotification();
     super.dispose();
+  }
+
+  /// 监听 App 前后台切换
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+
+    // 不再在后台取消定时器，保证通知栏可以继续刷新
+    if (state == AppLifecycleState.resumed) {
+      // 回到前台时静默刷新一次（当作自动刷新，不弹 WiFi 错误）
+      _refreshStatus(auto: true);
+    }
   }
 
   /// 从 SharedPreferences 读取自动刷新间隔
@@ -280,7 +296,7 @@ class _HomePageState extends State<HomePage> {
         _lastError = null;
       });
 
-      // 5. 同步更新通知栏
+      // 5. 同步更新通知栏（前台/后台都生效）
       await NotificationService.instance.updateStatusNotification(
         batteryPercent: batteryPercent,
         hostCount: hostCount,
@@ -387,7 +403,7 @@ class _HomePageState extends State<HomePage> {
         _isLoading = false;
       });
     } else {
-      // 自动刷新就不再触发一次 setState，直接标记即可
+      // 自动刷新就不额外 setState，只标记即可
       _isLoading = false;
     }
   }
