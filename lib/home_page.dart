@@ -4,10 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'config_repository.dart';
 import 'api_client.dart';
 import 'notification_service.dart';
+import 'wifi_task.dart';
 
 class HomePage extends StatefulWidget {
   final ConfigRepository configRepository;
@@ -64,7 +66,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // 先加载本地保存的自动刷新配置
     _loadAutoRefreshConfig();
 
-    // 首次进入，如果已有完整配置，自动刷新一次并启动定时刷新
+    // 首次进入，如果已有完整配置，自动刷新一次并启动定时刷新 + 前台服务
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final hasConfigured =
           _addrController.text.trim().isNotEmpty &&
@@ -75,6 +77,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (hasConfigured) {
         _refreshStatus(auto: true);
         _startAutoRefresh();
+        _startForegroundTask();
       }
     });
   }
@@ -99,7 +102,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
 
-    // 不再在后台取消定时器，保证通知栏可以继续刷新
+    // 不在后台停掉定时器，保证通知栏可以继续刷新
     if (state == AppLifecycleState.resumed) {
       // 回到前台时静默刷新一次（当作自动刷新，不弹 WiFi 错误）
       _refreshStatus(auto: true);
@@ -123,7 +126,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     await prefs.setInt('auto_refresh_seconds', _autoRefreshSeconds);
   }
 
-  /// 开启 / 重启自动刷新
+  /// 开启 / 重启自动刷新（页面内部用的 Timer，前台服务是另外一套）
   void _startAutoRefresh() {
     _autoRefreshTimer?.cancel();
     if (_autoRefreshSeconds <= 0) return;
@@ -135,6 +138,84 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       },
     );
   }
+
+  // ================= 前台服务相关（flutter_foreground_task 9.1.0） =================
+
+  Future<void> _requestFgPermissions() async {
+    final notificationPermission =
+    await FlutterForegroundTask.checkNotificationPermission();
+    if (notificationPermission != NotificationPermission.granted) {
+      await FlutterForegroundTask.requestNotificationPermission();
+    }
+
+    // 建议提示用户忽略电池优化（否则系统可能频繁杀服务）
+    if (Theme.of(context).platform == TargetPlatform.android) {
+      final ignoring =
+      await FlutterForegroundTask.isIgnoringBatteryOptimizations;
+      if (!ignoring) {
+        await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+      }
+    }
+  }
+
+  /// init 在 9.x 里是 void，不能 await
+  void _initForegroundTask() {
+    FlutterForegroundTask.init(
+      androidNotificationOptions: AndroidNotificationOptions(
+        channelId: 'sui_shen_wifi_fg',
+        channelName: '随身WiFi 后台刷新',
+        channelDescription: '用于在后台刷新电量与在线设备状态的前台服务',
+        onlyAlertOnce: true,
+        priority: NotificationPriority.HIGH,
+      ),
+      iosNotificationOptions: IOSNotificationOptions(
+        showNotification: true,
+        playSound: false,
+      ),
+      foregroundTaskOptions: ForegroundTaskOptions(
+        // 使用当前配置的自动刷新间隔
+        eventAction:
+        ForegroundTaskEventAction.repeat(_autoRefreshSeconds * 1000),
+        autoRunOnBoot: false,
+        autoRunOnMyPackageReplaced: true,
+        allowWakeLock: true,
+        allowWifiLock: true,
+      ),
+    );
+  }
+
+  Future<void> _startForegroundTask() async {
+    // 已在运行就不重复启动
+    final isRunning = await FlutterForegroundTask.isRunningService;
+    if (isRunning) return;
+
+    await _requestFgPermissions();
+
+    // 9.1.0 的 init 是同步的
+    _initForegroundTask();
+
+    final result = await FlutterForegroundTask.startService(
+      serviceId: 100,
+      serviceTypes: const [ForegroundServiceTypes.dataSync],
+      notificationTitle: '随身WiFi',
+      notificationText: '正在后台刷新电量与在线设备状态…',
+      callback: wifiTaskStartCallback, // 在 wifi_task.dart 里定义
+    );
+
+    // ✅ 9.1.0 中 ServiceRequestResult 是 sealed class，用 is 判断
+    if (result is! ServiceRequestSuccess) {
+      debugPrint('启动前台服务失败: $result');
+    }
+  }
+
+  Future<void> _stopForegroundTask() async {
+    final result = await FlutterForegroundTask.stopService();
+    if (result is! ServiceRequestSuccess) {
+      debugPrint('停止前台服务失败: $result');
+    }
+  }
+
+  // ================= 原有逻辑 =================
 
   /// 保证当前连接的 WiFi SSID 等于目标 SSID
   /// showError = false 时，只返回 true/false，不修改 _lastError（用于自动刷新静默失败）
@@ -296,18 +377,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         _lastError = null;
       });
 
-      // 5. 同步更新通知栏（前台/后台都生效）
-      await NotificationService.instance.updateStatusNotification(
-        batteryPercent: batteryPercent,
-        hostCount: hostCount,
-      );
+      // 5. 通知栏更新：
+      //    若前台服务在跑，则由前台服务自己的通知为准；
+      //    否则用本地 NotificationService 顶一条通知。
+      final isRunningService = await FlutterForegroundTask.isRunningService;
+      if (!isRunningService) {
+        await NotificationService.instance.updateStatusNotification(
+          batteryPercent: batteryPercent,
+          hostCount: hostCount,
+        );
+      }
     }
 
     try {
       await doFetch();
     } catch (e) {
-      // 只要是接口返回的 ApiException（包括 session 失效 / retcode != 0 /
-      // HTTP 状态码异常 / 返回 HTML 等），在允许重登的情况下重登一次并重试
+      // 只要是 ApiException，在允许重登的情况下重登一次并重试
       if (allowLoginRetry && e is ApiException) {
         final ok = await _loginOnce();
         if (!ok) return;
@@ -326,7 +411,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  /// 保存配置 + 首次登录 + 获取状态 + 开启自动刷新
+  /// 保存配置 + 首次登录 + 获取状态 + 开启自动刷新 + 启动前台服务
   Future<void> _saveAndFetch() async {
     if (_isLoading) return;
     setState(() {
@@ -379,6 +464,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
 
     _startAutoRefresh();
+    await _startForegroundTask(); // 保存成功后启动前台服务
 
     setState(() {
       _isLoading = false;
